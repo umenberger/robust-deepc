@@ -4,6 +4,6 @@ Code to reproduce examples in 'Closed-loop data-enabled predictive control' subm
 Please run cdc_illustration.m
 
 Dependencies:
-	yalmip, available: https://yalmip.github.io/
+yalmip, available: https://yalmip.github.io/
 
-	mosek, available: https://www.mosek.com/
+mosek, available: https://www.mosek.com/
