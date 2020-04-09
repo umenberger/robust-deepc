@@ -1,0 +1,565 @@
+classdef deepc
+   
+% control problem properties      
+    properties
+             
+        horizon = nan;
+        Q = nan;
+        R = nan;
+        
+        umin = nan;
+        umax = nan;
+        
+        ymin = nan;
+        ymax = nan;        
+        
+        w_mag = nan;
+        
+        resolve_period = nan;
+        
+        reference = nan;
+               
+    end
+    
+% deepc controller properties   
+    properties 
+        
+        Tini = nan;
+        Tf = nan;
+        
+% pre-control data        
+        u_data = nan;
+        w_data = nan;
+        y_data = nan;
+        
+% observed data during the control period
+        u_hist = nan;
+        y_hist = nan;
+        w_hist = nan;
+                
+% initial condition data for the deepc program
+        ui = nan;
+        wi = nan;
+        yi = nan;
+        
+% relative index
+        rel_index = 1;
+        
+% closed/open loop
+        closed_loop = 0; % off by default
+        
+% non-robust version: ignore future disturbances
+        non_robust = 0; % off by default
+        
+% soft output constraint
+        soft_y_constraint = 0;        
+        soft_y_reg = 1e3;
+        
+% regularize the nullspace variable
+        nullspace_regularization = 0;
+        
+% g regularization
+        soln_regularization = 0;
+        
+% control policy
+        u_nom = nan;
+        gain = nan;
+        
+% pem-mode: ignore param of nullsapce (off by default)
+        pem_mode = 0;
+        
+% compute and store computation times
+        record_computation_time = 1;
+        
+        comp_times = []; % kind of dumb, should use contructor
+        
+% sparsity in the controller gain
+        disturbance_lags = 0; % dense (non-sparse) by default                
+    end
+    
+    
+    methods
+        
+               
+%% add observations
+% update the previous history 
+% for now, we will pass in the entire previous history
+% then we can easily figure out what time we're at by checking the length 
+
+        function obj = update_observations(obj,u_history,w_history,y_history)
+            
+            obj.u_hist = u_history;
+            obj.w_hist = w_history;
+            obj.y_hist = y_history;
+            
+        end
+        
+%% 
+
+        function [obj,u] = get_control(obj,time)
+    
+% first, check to see if you're at the appropriate time
+            u_hist = obj.u_hist;
+            w_hist = obj.w_hist;
+            y_hist = obj.y_hist;
+            
+            nu = size(u_hist,1);
+            nw = size(w_hist,1);                        
+            
+            t = size(w_hist,2) - obj.Tini + 1;
+                        
+            if time == t
+                
+                k = obj.rel_index;
+                
+% if you're at the correct time, you can continue
+% next we check the relative index
+                if (k == obj.resolve_period + 1) || (t == 1)
+                    
+% it's time to update the policy 
+
+% now we need to compute the reference                     
+                    ref = obj.reference;
+                    h = obj.horizon;
+                    
+% make sure that the reference signal is not too long                    
+                    if t + h - 1 < size(ref,2)                         
+                        r = ref(:,t:t+h-1);
+                    else
+                        r = ref(:,t:end);
+                    end
+                    
+% much like the reference, pass in the constraints   
+                    ymax = obj.ymax;
+                    ymin = obj.ymin;
+                    
+                    if t + h - 1 < size(ymax,2)                         
+                        y_max = ymax(:,t:t+h-1);
+                        y_min = ymin(:,t:t+h-1);
+                    else
+                        y_max = ymax(:,t:end);
+                        y_min = ymin(:,t:end);
+                    end                    
+
+                    res = compute_control(obj,r,y_max,y_min);
+                                        
+                    obj.rel_index = 1; % reset
+                    
+                    obj.u_nom = res.u;
+                    
+                    if obj.closed_loop
+                        obj.gain = res.K;
+                    end
+                                        
+                    fprintf('Updated policy:\n')
+                    fprintf('\tinfo: %s\n',res.sol.info) 
+                    fprintf('\topt-cost: %.5e\n',res.cost)
+                    
+                    if obj.record_computation_time
+                       
+                        obj.comp_times = [obj.comp_times;res.sol.solvertime];
+                        
+                    end
+                    
+                    
+                end
+                    
+                k = obj.rel_index;     
+                
+% now return the actual control
+                if obj.closed_loop
+                       
+                    Ktmp = obj.gain((k-1)*nu+1:k*nu,1:k*nw);
+                    wtmp = [w_hist(:,end-k+2:end) zeros(nw,1)];
+                                                                               
+                    u = obj.u_nom(:,k) + 1*Ktmp*wtmp(:);  
+                                        
+                else
+                    
+                    u = obj.u_nom(:,k);
+                    
+                end
+                    
+                obj.rel_index = obj.rel_index + 1; % increment relative index
+  
+                
+            else
+               
+                error('wrong time')
+                
+            end
+                
+  
+        end
+
+        
+%% compute control
+% this will just update the internal values for the control sequence
+        function res = compute_control(obj,r,ymax,ymin)
+            
+
+            u = obj.u_data;
+            y = obj.y_data;
+            w = obj.w_data;
+
+            w_mag = obj.w_mag;
+
+            [nu,T] = size(u);
+            ny = size(y,1);
+            nw = size(w,1);
+
+            Tini = obj.Tini;
+
+            rl = size(r,2);
+            
+            Tf = rl;
+
+            L = Tini + Tf;
+
+            Q = obj.Q;
+            R = obj.R;
+
+            umin = obj.umin;
+            umax = obj.umax;
+
+            closed_loop = obj.closed_loop;   
+            
+            soft_y_constraint = obj.soft_y_constraint;
+            
+%% initial quantities
+
+            uprev = obj.u_hist;
+            wprev = obj.w_hist;
+            yprev = obj.y_hist;
+
+            nup = size(uprev,2);
+
+            if nup < Tini
+                uini = [zeros(nu,Tini-nup), uprev];
+                wini = [zeros(nw,Tini-nup), wprev];
+                yini = [zeros(ny,Tini-nup), yprev];
+            else
+                uini = uprev(:, end-Tini+1:end);
+                wini = wprev(:, end-Tini+1:end);
+                yini = yprev(:, end-Tini+1:end);
+            end
+
+            % now we need to convert to stacked vectors
+            uini = uini(:);
+            wini = wini(:);
+            yini = yini(:);            
+            
+%% form Hankel matrices
+
+            U = vec2block_hankel(u,L);
+            W = vec2block_hankel(w,L);
+            Y = vec2block_hankel(y,L);
+
+            Up = U(1:nu*Tini,:);
+            Uf = U(nu*(Tini+1):end,:);
+
+            Wp = W(1:nw*Tini,:);
+            Wf = W(nw*(Tini+1):end,:);
+
+            Yp = Y(1:ny*Tini,:);
+            Yf = Y(ny*(Tini+1):end,:);    
+            
+%% output 
+
+            D = [Up; Wp; Yp; Uf; Wf];
+
+            Dinv = pinv(D);
+            Dperp = eye(size(D,2)) - Dinv*D;
+
+            nn = size(Dperp,2);
+
+            ni = (size(uini,1)+size(wini,1)+size(yini,1));
+            Ai = Yf*Dinv(:,1:ni);
+
+            nuc = rl*nu;
+            Au = Yf*Dinv(:,ni+1:ni+nuc);
+
+            Aw = w_mag*Yf*Dinv(:,ni+nuc+1:end); % note: magnitude is incorporated
+
+            An = Yf*Dperp;  
+            
+            if soft_y_constraint
+                               
+                yi_err = sdpvar(size(yini,1),1);
+                
+            end
+            
+            
+%% now introduce some decision variables 
+
+            uf = sdpvar(nu*rl,1); % open-loop control inputs/nominal controls
+
+            n = sdpvar(nn,1); % parametrize the null-space of H  
+            
+% note: should probably just remove n as a decision variable...            
+            if obj.pem_mode
+                n_on_cost = 0;
+                n_on_const = 0;
+            else
+                n_on_cost = 1;
+                n_on_const = 1;
+            end
+
+%% nominal trajectory with output constraints
+
+% tracking error: set w to zero
+            if soft_y_constraint
+                cost = sum(sum(abs(Ai*[uini;wini;yini + yi_err]  + Au*uf + n_on_cost*An*n - r(:)))) ...
+                       + obj.soft_y_reg*sum(abs(yi_err)); %
+            else
+                cost = sum(sum(abs(Ai*[uini;wini;yini] + Au*uf + n_on_cost*An*n - r(:))));
+            end
+            
+% now, encode the constraints            
+            
+            % we use an inf-norm bound on w to represent the hyperbox 
+            Hw = [eye(nw*rl); -eye(nw*rl)];
+            hw = ones(2*nw*rl,1);
+            
+% modify Aw for the cloed-loop case:
+            if closed_loop
+                K = obj.causal_control_map(nu,nw,rl);
+                Aw_mod = Aw + Au*K;
+            else
+                Aw_mod = Aw;
+            end                        
+                      
+            const_y = [];               
+            
+% this is just the nominal output, no disturbances              
+            if obj.non_robust                 
+                y_nr = Ai*[uini;wini;yini]  + Au*uf + n_on_cost*An*n;                
+            end
+            
+                        
+            for k = 1:rl
+                
+% outer polytope for the constraint containment
+                Hy = [eye(ny); -eye(ny)];
+                hy = [ymax(:,k); -ymin(:,k)];
+                
+% now we have to produce y(k) as a function of disturbances and decision variables
+% this involves extracting the kth block row
+                Ai_k = Ai((k-1)*ny+1:k*ny,:);
+
+                Au_k = Au((k-1)*ny+1:k*ny,:);
+                
+                Aw_mod_k = Aw_mod((k-1)*ny+1:k*ny,:);
+
+                An_k = An((k-1)*ny+1:k*ny,:); 
+                                                
+                Lambda = sdpvar(2*ny,2*nw*rl,'full');
+                beta = sdpvar(ny,1);
+
+                
+                if obj.non_robust
+                    
+% just make sure the nominal output is in the constraint set                    
+                    const_tmp = [Hy*y_nr((k-1)*ny+1:k*ny,:) <= hy];                    
+                
+                elseif soft_y_constraint
+                    
+                    const_tmp = [ Lambda*Hw == Hy*Aw_mod_k, ...
+                                         -(Ai_k*[uini;wini;yini + yi_err] + Au_k*uf + n_on_const*An_k*n) == beta, ...
+                                         Lambda*hw <= hy + Hy*beta, ...
+                                         Lambda(:) >= 0];                     
+                    
+                else
+                
+                    const_tmp = [ Lambda*Hw == Hy*Aw_mod_k, ...
+                                         -(Ai_k*[uini;wini;yini] + Au_k*uf + n_on_const*An_k*n) == beta, ...
+                                         Lambda*hw <= hy + Hy*beta, ...
+                                         Lambda(:) >= 0]; 
+                                     
+                end
+                     
+                const_y = [const_y, const_tmp];
+ 
+            end
+            
+                        
+
+%% constraints on inputs
+
+            if closed_loop
+
+            % h-polytope parma of constraints    
+                Hu = [eye(nu*rl); -eye(nu*rl)];
+                hu = [umax*ones(nu*rl,1); -umin*ones(nu*rl,1)];    
+
+                Lambda_u = sdpvar(2*nu*rl,2*nw*rl,'full');   
+
+                const_u = [Hu*uf <= hu - Lambda_u*hw,... % without the last term, same as OL
+                           Lambda_u*Hw == Hu*K*w_mag, ...
+                           Lambda_u(:) >= 0];
+
+            else
+
+                const_u = [uf <= umax*ones(nu*rl,1), uf >= umin*ones(nu*rl,1)];
+
+            end
+            
+            
+%% regularization of the solution
+
+            g_reg = obj.soln_regularization;
+            
+            if g_reg
+                
+                g = Dinv(:,1:ni)*[uini;wini;yini] + ...
+                    Dinv(:,ni+1:ni+nuc)*uf + ...
+                    Dperp*n;                    
+                
+                cost = cost + g_reg*(g'*g);                
+                
+            end
+                      
+
+%% solve the program
+
+            ops = sdpsettings('solver','mosek');
+            ops.verbose = 0;
+
+%             constraints = [const_u, const_obj_cntmnt];
+            constraints = [const_u, const_y];
+
+            sol = solvesdp(constraints,cost,ops);
+
+            uf = double(uf);
+
+            res.u = reshape(uf,nu,rl);
+            
+%             fprintf('nominal control:\n')
+%             res.u
+
+            res.sol = sol;
+
+            if closed_loop
+                res.K = double(K);
+                
+%                 fprintf('disturbane feedback:\n')
+%                 res.K
+                
+            end
+
+            res.cost = double(cost);
+
+
+%%
+
+            yalmip('clear')          
+                                
+       
+        end
+    
+    
+    end
+    
+    
+  
+    methods 
+        
+        
+        function K = causal_control_map(obj,nu,nw,h)
+
+%             K = sdpvar(nu*h,nw*h,'full');
+            
+%             K = kron(sdpvar(nu,nw,'full'),toeplitz([0;1;zeros(h-2,1)],zeros(1,h)));
+
+              k = sdpvar(1);
+              
+              K = zeros(1,h);
+              
+              for i = 2:h
+                 
+                  K = [K; [zeros(1,i-2), k, zeros(1,h-i+1)]];
+                  
+              end
+              
+%               K = [K; zeros(h-2,h)];
+
+
+%             for i = 1:h
+% 
+%                 K((i-1)*nu+1:i*nu, (i-1)*nw+1:end) = zeros(nu,nw*(h-i+1));
+% 
+%             end
+%             
+%             if obj.disturbance_lags > 0
+%                 
+%                 d = obj.disturbance_lags;
+%                
+%                 for i = 1:h
+% 
+% %                     K(i*nu + (d)*nu + 1:end, (i-1)*nw+1:i*nw) = zeros(nu*(h-i-d),nw);
+%                     K(i*nu + (d-1)*nu + 1:end, (i-1)*nw+1:i*nw) = zeros(nu*(h-i-d+1),nw);
+%                     
+%                 end
+% 
+%             end
+                
+                
+                
+        end
+
+
+    end     
+        
+    
+    
+    
+    
+    
+    
+%     methods (Static)
+%         
+%         
+%         function K = causal_control_map(nu,nw,h)
+% 
+%             K = sdpvar(nu*h,nw*h,'full');
+% 
+%             for i = 1:h
+% 
+%                 K((i-1)*nu+1:i*nu, (i-1)*nw+1:end) = zeros(nu,nw*(h-i+1));
+% 
+%             end
+% 
+%             
+% %             K_ = sdpvar(nu,nw,'full');
+% %             
+% %             tmp = kron(eye(h-1),K_);
+% %             
+% %             K = [zeros(nu,nw*h);
+% %                  tmp, zeros(nu*(h-1),nw)];
+% 
+% 
+% 
+% %             K = 0;
+% % 
+% %             for i = 1:h
+% % 
+% %                 e = zeros(h,1);
+% %                 e(i) = 1;
+% %                 
+% %                 K = K + kron(diag(e),sdpvar(nu,nw,'full'));                
+% % 
+% %             end           
+% 
+% 
+%         end        
+%         
+%         
+%         
+%         end
+    
+    
+    
+    
+    
+    
+end

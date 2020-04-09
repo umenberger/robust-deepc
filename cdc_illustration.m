@@ -1,0 +1,228 @@
+%% outline 
+% clc
+% close all
+clear w_tst
+% clear all
+
+% code to reproduce example from'Closed-loop data-enabled predictive 
+% control' submitted to CDC 2020
+
+
+%%
+
+num_trials = 3;
+
+tracking_errors = nan(3,num_trials);
+
+violations = nan(1,num_trials);
+
+computation_times = [];
+
+for trial_index = 1:num_trials
+
+    %% true system
+
+    sys_true = dynamical_nonlinear(zeros(4,1));
+
+    %% control task specification
+
+    umin = -1;
+    umax = 1;
+    w_mag = 1;
+
+    %% generate data
+
+    Ti = 500; % initial data 
+
+    u_trn = randn(sys_true.nu,Ti);
+    w_trn = w_mag*(-1 + 2*rand(sys_true.nw,Ti));
+
+    u_trn(u_trn<umin) = umin; % make sure inputs are 'valid'
+    u_trn(u_trn>umax) = umax; % not really necessary though 
+
+    sys_true = sys_true.simulate(u_trn,w_trn);
+
+%     figure
+%     plot(1:Ti,sys_true.y(1,1:Ti))
+
+    %% alternate reference
+
+    ri = [1,0,1,0.0,0];
+    li = [10,10,10,10,20];
+
+    % ymax =  1*1.1*[1.0,1.0,1.0,1.0,1.0];
+    % ymin = -1*1.1*[1.0,1.0,1.0,1.0,1.0];
+    ymax =  1*1.1*[1.0,1.0,1.0,1.0,1.0];
+    ymin = -100*1.1*[1.0,1.0,1.0,1.0,1.0];
+
+    r = [];
+    ymaxs = [];
+    ymins = [];
+    for i = 1:size(ri,2)
+        r = [r,ri(:,i).*ones(1,li(i))]; 
+        ymaxs = [ymaxs, ymax(i).*ones(1,li(i))];
+        ymins = [ymins, ymin(i).*ones(1,li(i))];
+    end
+
+%     figure
+%     plot(1:sum(li), r(1,:))
+%     hold on
+%     plot(1:sum(li), ymaxs(1,:))
+%     plot(1:sum(li), ymins(1,:))
+
+
+    %% control setup
+
+    Tcs = 40; % total reference signal length
+
+    horizon = 10; % horizon
+    Q = 1;
+    R = 0;
+    resolve_period = 5; % timesteps between control synthesis
+    Tini = 10;
+
+    ops_deepc = deepc;
+
+    ops_deepc.horizon = horizon;
+    ops_deepc.Q = Q;
+    ops_deepc.R = R;
+    ops_deepc.umin = umin;
+    ops_deepc.umax = umax;
+    ops_deepc.ymin = ymins;
+    ops_deepc.ymax = ymaxs;
+    ops_deepc.w_mag = w_mag;
+    ops_deepc.resolve_period = resolve_period;
+    ops_deepc.Tini = Tini;
+
+    [~,hu,hw,hy] = sys_true.get_history();
+    ops_deepc.u_data = hu;
+    ops_deepc.w_data = hw;
+    ops_deepc.y_data = hy;
+
+    ops_deepc.reference = r;
+
+    ops_deepc.soft_y_constraint = 0;
+
+    ops_deepc.soln_regularization = 10;
+
+    ops_deepc_ol = ops_deepc;
+
+% closed-loop    
+    ops_deepc_cl = ops_deepc;
+    ops_deepc_cl.closed_loop = 1;
+    
+% non-robust    
+    ops_deepc_nr = ops_deepc;  
+    ops_deepc_nr.non_robust = 1;
+
+    %% initial conditions
+
+    sys_init = dynamical_nonlinear(zeros(4,1));
+    sys_init = sys_init.simulate(zeros(sys_init.nu,Tini),zeros(sys_init.nw,Tini));
+
+    sys_ol = sys_init;
+    sys_cl = sys_init;
+    sys_nr = sys_init;
+
+    %% disturbances
+
+    % disturbance sequence  
+    nw = sys_true.nw;
+
+    if ~exist('w_tst')
+
+        w_tst = zeros(nw,Tcs);
+        w_ = 0;
+        for i = 1:Tcs
+           w_tst(:,i) = 0.2*2*(-1 + 2*rand(nw,1)) + 0.8*w_;
+           w_ = w_tst(:,i);
+        end
+
+        w_tst(w_tst > w_mag) = w_mag;
+        w_tst(w_tst < -w_mag) = -w_mag;
+
+        w_tst = 1*w_tst;
+
+    end
+
+    %% closed-loop
+
+    for t = 1:Tcs
+
+        fprintf('t = %d\n',t)
+
+    % deepc: open-loop
+    %-------------------------------------------------------------------------- 
+        fprintf('\n*** open-loop:\n')
+
+        [~,hu,hw,hy] = sys_ol.get_history();
+
+        ops_deepc_ol = ops_deepc_ol.update_observations(hu,hw,hy);
+
+        [ops_deepc_ol,u] = ops_deepc_ol.get_control(t);
+
+        sys_ol = sys_ol.simulate(u,w_tst(:,t));
+
+    % deepc: closed-loop
+    %--------------------------------------------------------------------------     
+        fprintf('\n***closed-loop:\n')
+
+        [~,hu,hw,hy] = sys_cl.get_history();
+
+        ops_deepc_cl = ops_deepc_cl.update_observations(hu,hw,hy);    
+
+        [ops_deepc_cl,u] = ops_deepc_cl.get_control(t);
+
+        sys_cl = sys_cl.simulate(u,w_tst(:,t));   
+        
+    % deepc: non-robust
+    %--------------------------------------------------------------------------     
+        fprintf('\n***non-robust:\n')
+
+        [~,hu,hw,hy] = sys_nr.get_history();
+
+        ops_deepc_nr = ops_deepc_nr.update_observations(hu,hw,hy);    
+
+        [ops_deepc_nr,u] = ops_deepc_nr.get_control(t);
+
+        sys_nr = sys_nr.simulate(u,w_tst(:,t));          
+
+    end
+
+    %%
+
+    computation_times = [computation_times; [ops_deepc_ol.comp_times,ops_deepc_cl.comp_times,ops_deepc_nr.comp_times]];
+
+    errors = cdc_plot(ops_deepc,sys_ol,sys_cl,sys_nr);
+
+    tracking_errors(:,trial_index) = errors.norm_1;
+    
+    violations(trial_index) = errors.violation;
+
+    clear w_tst
+
+
+end
+
+%% print some stats
+
+fprintf('\n\ntracking error\n')
+fprintf('open-loop  closed-loop  non-robust\n')
+fprintf('mean:\n')
+mean(tracking_errors')
+
+fprintf('std:\n')
+std(tracking_errors')
+
+fprintf('\n\ncomputation time\n')
+fprintf('open-loop  closed-loop  non-robust\n')
+fprintf('mean:\n')
+mean(computation_times)
+fprintf('std:\n')
+std(computation_times)
+
+
+
+
+
+
